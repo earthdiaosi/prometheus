@@ -18,10 +18,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"io/ioutil"
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
@@ -32,6 +34,31 @@ import (
 type customSD struct {
 	Targets []string          `json:"targets"`
 	Labels  map[string]string `json:"labels"`
+}
+
+//return targetsHash.Sum64() ^ labelsHash.Sum64(), nil
+func (sd *customSD) hash() (uint64, error) {
+	//targetsHash = init ^ hash(targets[0]) ^ hash(targets[1]) ^ ... ^ hash(targets[n-1])
+	targetsHash := fnv.New64()
+	for _, target := range sd.Targets {
+		if _, err := targetsHash.Write([]byte(target)); err != nil {
+			return 0, err
+		}
+	}
+	//sort labels
+	keys := make([]string, 0, len(sd.Labels))
+	for key := range sd.Labels {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	//labelsHash = init ^ hash(labels[0].(k:v)) ^ hash(labels[1].(k:v)) ^ ... ^ hash(labels[n-1].(k:v))
+	labelsHash := fnv.New64()
+	for _, key := range keys {
+		if _, err := labelsHash.Write([]byte(key + ":" + sd.Labels[key])); err != nil {
+			return 0, err
+		}
+	}
+	return targetsHash.Sum64() ^ labelsHash.Sum64(), nil
 }
 
 // Adapter runs an unknown service discovery implementation and converts its target groups
@@ -59,7 +86,7 @@ func mapToArray(m map[string]*customSD) []customSD {
 func (a *Adapter) generateTargetGroups(allTargetGroups map[string][]*targetgroup.Group) {
 	tempGroups := make(map[string]*customSD)
 	for k, sdTargetGroups := range allTargetGroups {
-		for i, group := range sdTargetGroups {
+		for _, group := range sdTargetGroups {
 			newTargets := make([]string, 0)
 			newLabels := make(map[string]string)
 
@@ -72,12 +99,22 @@ func (a *Adapter) generateTargetGroups(allTargetGroups map[string][]*targetgroup
 			for name, value := range group.Labels {
 				newLabels[string(name)] = string(value)
 			}
-			// Make a unique key, including the current index, in case the sd_type (map key) and group.Source is not unique.
-			key := fmt.Sprintf("%s:%s:%d", k, group.Source, i)
-			tempGroups[key] = &customSD{
+
+			sdGroup := customSD{
 				Targets: newTargets,
 				Labels:  newLabels,
 			}
+			// Make a unique key, including the current index, in case the sd_type (map key) and group.Source is not unique.
+			groupHash, err := sdGroup.hash()
+			if err != nil {
+				// Treat this error as fatal for this iteration of updating target groups,
+				// it's better to leave the previous (potentially stale) groups than update
+				// and end up with incomplete target groups.
+				level.Error(log.With(a.logger, "component", "sd-adapter")).Log("err", err)
+				return
+			}
+			key := fmt.Sprintf("%s:%s:%d", k, group.Source, groupHash)
+			tempGroups[key] = &sdGroup
 		}
 	}
 	if !reflect.DeepEqual(a.groups, tempGroups) {
